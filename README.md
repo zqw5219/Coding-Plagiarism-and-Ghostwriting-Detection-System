@@ -1,6 +1,4 @@
-# Authorizer
- Spring 2021 DS 340W Semester Project
-
+# Coding Plagiarism and Ghostwriting Detection System
 
 ## Convention
 
