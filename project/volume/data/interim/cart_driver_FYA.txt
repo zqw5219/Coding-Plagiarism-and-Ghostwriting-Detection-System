@@ -1,0 +1,714 @@
+////////////////////////////////////////////////////////////////////////////////
+//
+//  File           : cart_driver.c
+//  Description    : This is the implementation of the standardized IO functions
+//                   for used to access the CART storage system.
+//
+//  Author         : Yuan Fu
+//  PSU email      : ykf5041@psu.edu
+//
+
+// Includes
+#include <stdlib.h>
+#include <string.h>
+
+// Project Includes
+#include "cart_driver.h"
+#include "cart_controller.h"
+#include "cmpsc311_log.h"
+
+// Structs
+
+// states of a file
+typedef enum {
+  FD_EMPTY = -1,
+  FD_CLOSE = 0,
+  FD_OPEN = 1
+} fd_state;
+
+// a frame used by a file
+struct frame {
+  // cart id
+  int cid;
+  // frame id
+  int fid;
+};
+
+// the file, detail see below
+struct fd {
+  char filename[128];
+  // file size
+  int size;
+  // current position
+  int pos;
+  // all the frames the file used
+  struct frame frames[100];
+  // the state of the file
+  fd_state state;
+  // number of frames we have
+  int frame_count;
+};
+
+
+// Global vars
+
+// currently loaded cart id, -1 means none loaded
+int current_cart = -1;
+// 1 means cart hardware is on and inited, 0 means not
+int cart_is_on = 0;
+// all fd’s
+struct fd fd_table[1024];
+// last frame that we pulled out to store file.
+// At first fid is -1 so the first one wee add will have fid 0
+struct frame last_used_frame = {0, -1};
+// my debug level
+unsigned long CartDebugLevel;
+
+// Helpers
+
+/*
+ * Return the larger int from a & b
+ */
+int max(int a , int b) {
+  if (a > b)
+    return a;
+  else
+    return b;
+}
+
+/*
+ * Return the smaller int from a & b
+ */
+int min(int a , int b) {
+  if (a < b)
+    return a;
+  else
+    return b;
+}
+
+
+// Bus functions
+
+/*
+ * If reg’s return bit is 0, return 0,
+ * if reg’s return bit is 0, return -1
+ */
+int bus_is_ok(CartXferRegister reg) {
+  unsigned long bit = (reg << 16) >> 63;
+  if (bit == 0)
+    return 0;
+  else
+    return -1;
+}
+
+/*
+ * Wrapper function for op INITMS
+ * Just send all 0’s
+ */
+int bus_init_ms() {
+  return bus_is_ok(cart_io_bus((CartXferRegister) CART_OP_INITMS, NULL));
+}
+
+/*
+ * Wrapper function for op BZERO
+ * shift bits and send the opcode.
+ */
+int bus_zero_cart() {
+  CartXferRegister op = 0;
+  op = (op | CART_OP_BZERO) << (64 - 8);
+  return bus_is_ok(cart_io_bus(op, NULL));
+}
+
+
+/*
+ * Wrapper function for op LDCART
+ * Remember to set current_cart.
+ * shift bits and send the opcode.
+ */
+int bus_load_cart(int id) {
+  CartXferRegister op = 0;
+  CartXferRegister base = 0;
+  op |= (base | CART_OP_LDCART) << (64 - 8);
+  op |= (base | ((unsigned int) id)) << (63 - 32);
+  return bus_is_ok(cart_io_bus(op, NULL));
+}
+
+/*
+ * Wrapper function for op RDFRME
+ * shift bits and send the opcode.
+ */
+int bus_read_frame(int id, void *buf) {
+  CartXferRegister op = 0;
+  CartXferRegister base = 0;
+  op |= (base | CART_OP_RDFRME) << (64 - 8);
+  op |= (base | ((unsigned int) id)) << (63 - 48);
+  return bus_is_ok(cart_io_bus(op, buf));
+}
+
+/*
+ * Wrapper function for op WRFRME
+ * shift bits and send the opcode.
+ */
+int bus_write_frame(int id, void *buf) {
+  CartXferRegister op = 0;
+  CartXferRegister base = 0;
+  op |= (base | CART_OP_WRFRME) << (64 - 8);
+  op |= (base | ((unsigned int) id)) << (63 - 48);
+  return bus_is_ok(cart_io_bus(op, buf));
+}
+
+/*
+ * Wrapper function for op POWOFF
+ * shift bits and send the opcode.
+ */
+int bus_poweroff() {
+  CartXferRegister op = 0;
+  op = (op | CART_OP_POWOFF) << (64 - 8);
+  return bus_is_ok(cart_io_bus(op, NULL));
+}
+
+// Cart functions
+
+/*
+ * Load FRAME from START by COUNT, into BUF from BUFSTART by COUNT.
+ * Before use, check if count exceeds buf.
+ *
+ * 1. make sure cart is loaded
+ * 2. load frame out to a tmp buffer
+ * 3. copy the portion of tmp buffer that we want to
+ *    the portion of buf we want
+ */
+int read_frame(struct frame *frame, void *buf, int start,
+               int count, int bufstart) {
+  if (count > CART_FRAME_SIZE)
+    return -1;
+
+  logMessage(CartDebugLevel, "read_frame: frame: C %d F %d start: %d count: %d bufstart: %d",
+             frame->cid, frame->fid, start, count, bufstart);
+
+  // load cart
+  if (current_cart != frame->cid) {
+    if (bus_load_cart(frame->cid) < 0)
+      return -1;
+    current_cart = frame->cid;
+  }
+
+  char tmp_buf[CART_FRAME_SIZE];
+
+  if (bus_read_frame(frame->fid, tmp_buf) < 0)
+    return -1;
+
+  memcpy(buf+bufstart, tmp_buf+start, count);
+
+  return 0;
+}
+
+/*
+ * Add COUNT number of frames to FD.
+ * Also changes frame_count for you, how nice.
+ * Return -1 if no more frame is available, 0 if success
+ *
+ * 1. get the last used frame’s cart and frame id
+ * 2. get the next frame
+ * 3. add the frame to fd
+ * 4. repeat until we added count number of frames to fd
+ * 5. set last used frame to, well, the last used frame
+ */
+int add_frame(struct fd *fd, int count) {
+
+  // index for our new frame
+  int frame_idx = fd->frame_count;
+
+  int cid = last_used_frame.cid;
+  int fid = last_used_frame.fid;
+  struct frame new_frame = { 0, 0 };
+
+  if (cid == 1023 && fid == 1023)
+    return -1;
+
+  int i;
+  for (i=0; i<count; i++) {
+    fid++;
+
+    if (last_used_frame.fid == CART_CARTRIDGE_SIZE) {
+    // last frame
+    fid = 0;
+    cid += 1;
+    }
+
+    new_frame.cid = cid;
+    new_frame.fid = fid;
+    fd->frames[frame_idx] = new_frame;
+    fd->frame_count += 1;
+
+    logMessage(CartDebugLevel, "add_frame: loop: cid: %d fid: %d", cid, fid);
+  }
+
+  // record the use of this new frame
+  // don’t use = new_frame
+  last_used_frame.cid = cid;
+  last_used_frame.fid = fid;
+
+  logMessage(CartDebugLevel, "add_frame: last_used_frame: cid: %d fid: %d", cid, fid);
+
+  return 0;
+}
+
+/*
+ * Write to FRAME from START by COUNT, from BUF from BUFSTART by COUNT.
+ * Before use, check if count exceeds buf.
+ *
+ * 1. make sure cart is loaded
+ * 2. load frame out to a tmp buffer
+ * 3. copy the portion of BUF that we want to
+ *    the portion of tmp buffer we want
+ * 4. write tmp buffer back to FRAME
+ */
+int write_frame(struct frame *frame, void *buf, int start,
+                int count, int bufstart) {
+  if (count > CART_FRAME_SIZE)
+    return -1;
+
+  logMessage(CartDebugLevel, "write_frame: frame: C %d F %d start: %d count: %d bufstart: %d",
+             frame->cid, frame->fid, start, count, bufstart);
+
+  // load cart
+  if (current_cart != frame->cid) {
+    if (bus_load_cart(frame->cid) < 0)
+      return -1;
+    current_cart = frame->cid;
+  }
+
+  char tmp_buf[CART_FRAME_SIZE];
+
+  // load into tmp_buf
+  if (bus_read_frame(frame->fid, tmp_buf) < 0)
+    return -1;
+
+  // write to tmp_buf
+  memcpy(tmp_buf+start, buf+bufstart, count);
+
+  // write to frame
+  if (bus_write_frame(frame->fid, tmp_buf) < 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+/*
+ * Return an fid that can be used to store new file.
+ * Return -1 if failed.
+ *
+ * look through each files in fd_table and return
+ * the first one that state is empty
+ */
+int find_empty_fd() {
+  int i;
+  for (i=0; i < CART_MAX_TOTAL_FILES; i++) {
+    struct fd *fd = fd_table + i;
+    if (fd->state == FD_EMPTY)
+      return i;
+  }
+  return -1;
+}
+
+/*
+ * Return fid which has filename = FILENAME, return -1 if not found
+ * Return -2 if error
+ *
+ * look through each files in fd_table and return
+ * the first one has filename equal to FILENAME.
+ * If none found return -1
+ */
+int find_file_fd(char *filename) {
+  int i;
+  for (i=0; i < CART_MAX_TOTAL_FILES; i++) {
+    struct fd *fd = fd_table + i;
+    if (fd->state != FD_EMPTY && strcmp(fd->filename, filename) == 0) {
+      if (fd->state == FD_OPEN)
+        return -2;
+      else
+        return i;
+    }
+  }
+  return -1;
+}
+
+//
+// Implementation
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_poweron
+// Description  : Startup up the CART interface, initialize filesystem
+//
+// Inputs       : none
+// Outputs      : 0 if successful, -1 if failure
+
+// 1. send INITMS
+// 2. for each cart, load (LDCART) and zero (BZERO)
+// 3. for each file, set state to empty
+// 4. set cart_is_on
+int32_t cart_poweron(void) {
+  CartDebugLevel = registerLogLevel("CART_DRIVER_DEBUG", 0);
+
+  if (cart_is_on) {
+    logMessage(CartDebugLevel, "cart_poweron: cart is already on");
+    return -1;
+  }
+
+  // init cart
+  if (bus_init_ms() < 0)
+    return -1;
+
+  // load and zero each cart
+  int i;
+  for (i=0; i < CART_MAX_CARTRIDGES; i++) {
+    if (bus_load_cart(i) < 0)
+      return -1;
+    if (bus_zero_cart() < 0)
+      return -1;
+  }
+
+  // init fd_table
+  for (i = 0; i < CART_MAX_TOTAL_FILES; i++) {
+    struct fd *fd = fd_table + i;
+    fd->state = FD_EMPTY;
+  }
+
+  cart_is_on = 1;
+  // Return successfully
+  return(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_poweroff
+// Description  : Shut down the CART interface, close all files
+//
+// Inputs       : none
+// Outputs      : 0 if successful, -1 if failure
+
+// 1. for each file, set state to empty
+// 2. send POWOFF
+// 3. set cart_is_on
+int32_t cart_poweroff(void) {
+  if (!cart_is_on)
+    return -1;
+  int i;
+  for (i=0; i<CART_MAX_TOTAL_FILES; i++) {
+    struct fd *fd = fd_table + i;
+    fd->state = FD_EMPTY;
+  }
+
+  int ret = bus_poweroff();
+  if (ret < 0)
+    return -1;
+
+  cart_is_on = 0;
+  return 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_open
+// Description  : This function opens the file and returns a file handle
+//
+// Inputs       : path - filename of the file to open
+// Outputs      : file handle if successful, -1 if failure
+
+// 1. look for file that has FILENAME
+// 2. if none found, create a new file:
+//    file an empty file, fill in filename, pos, size, etc
+int16_t cart_open(char *path) {
+
+  logMessage(CartDebugLevel, "cart_open: path: %s", path);
+
+  // check for misuse
+  if (strlen(path) >= 128) {
+    logMessage(CartDebugLevel, "cart_open: path too long");
+    return -1;
+  }
+
+  // get a file descriptor
+  int fid;
+  if ((fid = find_file_fd(path)) < -1) {
+    logMessage(CartDebugLevel, "cart_open: find_file_fd failed");
+    return -1;
+  }
+
+  if (fid == -1)
+    fid = find_empty_fd();
+
+  if (fid < 0) {
+    logMessage(CartDebugLevel, "cart_open: find_empty_fd failed");
+    return -1;
+  }
+
+  // check for weirdness
+  struct fd *fd = fd_table + fid;
+  if (fd->state == FD_OPEN) {
+    logMessage(CartDebugLevel, "cart_open: file is already open");
+    return -1;
+  }
+
+  // setup
+  memcpy(fd->filename, path, strlen(path)+1);
+  fd->pos = 0;
+  fd->size = 0;
+  fd->state = FD_OPEN;
+
+  logMessage(CartDebugLevel, "cart_open: return fd: %d", fid);
+
+  // THIS SHOULD RETURN A FILE HANDLE
+  return fid;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_close
+// Description  : This function closes the file
+//
+// Inputs       : fd - the file descriptor
+// Outputs      : 0 if successful, -1 if failure
+
+// 1. get the file by FD
+// 2. set state to close
+int16_t cart_close(int16_t fd) {
+
+  logMessage(CartDebugLevel, "cart_close: fd: %d", fd);
+
+  // check for misuse
+  if (fd >= 1024 || fd < 0) {
+    logMessage(CartDebugLevel, "cart_close: invalid fd: %d", fd);
+    return -1;
+  }
+
+  // get fd
+  struct fd *myfd = fd_table + fd;
+
+  // check for weirdness
+  if (myfd->state != FD_OPEN) {
+    logMessage(CartDebugLevel, "cart_close: file not open");
+    return -1;
+  }
+
+  // close
+  myfd->state = FD_CLOSE;
+
+  // Return successfully
+  return (0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_read
+// Description  : Reads "count" bytes from the file handle "fh" into the
+//                buffer "buf"
+//
+// Inputs       : fd - filename of the file to read from
+//                buf - pointer to buffer to read into
+//                count - number of bytes to read
+// Outputs      : bytes read if successful, -1 if failure
+
+// 1. get the file by FD
+// 2. for each frame that is spanned by the portion we want to read:
+// 3. use READ_FRAME to load the portion of the frame that we want to into BUF
+//    at the position we want
+int32_t cart_read(int16_t fd, void *buf, int32_t count) {
+
+  logMessage(CartDebugLevel, "cart_read: fd: %d count: %d", fd, count);
+
+  // check for misuse
+  if (fd >= 1024 || fd < 0) {
+    logMessage(CartDebugLevel, "cart_read: invalid fd: %d", fd);
+    return -1;
+  }
+
+  // get fd
+  struct fd *myfd = fd_table + fd;
+
+  // only read what we have
+  count = min(myfd->size - myfd->pos, count);
+
+  // check for error
+  if (myfd->state != FD_OPEN) {
+    logMessage(CartDebugLevel, "cart_read: file not open");
+    return -1;
+  }
+
+  // current pos
+  int pos = myfd->pos;
+  // pos become this at the end of read
+  int endpos = pos + count;
+
+  // calculate frame info
+
+  // which frame of the file we are using
+  int frame_idx = pos / CART_FRAME_SIZE;
+  // position of each frame
+  int frame_pos = pos % CART_FRAME_SIZE;
+  int unread_count = count;
+
+  // copy data
+
+  // amount of bytes we are copying into buf each time
+  // this is for the first frame
+  int frame_count;
+  struct frame *frame;
+  // position of buffer buf
+  int bufpos = 0;
+  while (pos < endpos) {
+    frame = myfd->frames + frame_idx;
+    frame_count = min(CART_FRAME_SIZE - frame_pos, unread_count);
+
+    logMessage(CartDebugLevel, "cart_read: loop: pos: %d frame_idx: %d frame_pos: %d frame_count: %d bufpos: %d",
+               pos, frame_idx, frame_pos, frame_count, bufpos);
+
+    if (read_frame(frame, buf, frame_pos, frame_count, bufpos) < 0) {
+      logMessage(CartDebugLevel, "cart_read: read_frame failed");
+      return -1;
+    }
+
+    frame_idx++;
+    frame_pos = 0;
+    bufpos += frame_count;
+    pos += frame_count;
+    unread_count -= frame_count;
+  }
+
+  // update fd
+  myfd->pos = pos;
+
+  logMessage(CartDebugLevel, "cart_read: finished: pos: %d", pos);
+
+  // Return successfully
+  return (count);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_write
+// Description  : Writes "count" bytes to the file handle "fh" from the
+//                buffer  "buf"
+//
+// Inputs       : fd - filename of the file to write to
+//                buf - pointer to buffer to write from
+//                count - number of bytes to write
+// Outputs      : bytes written if successful, -1 if failure
+
+// 1. get file by FD
+// 2. for each frame that is spanned by the portion we are writing:
+// 3. use WRITE_FRAME to write the portion of the frame that we want by the data
+//    in the portion of BUF that we want
+int32_t cart_write(int16_t fd, void *buf, int32_t count) {
+
+  logMessage(CartDebugLevel, "cart_write: fd: %d, count: %d", fd, count);
+
+  if (fd >= 1024 || fd < 0) {
+    logMessage(CartDebugLevel, "cart_write: invalid fd: %d", fd);
+    return -1;
+  }
+
+  struct fd *myfd = fd_table + fd;
+
+  if (myfd->state != FD_OPEN) {
+    logMessage(CartDebugLevel, "cart_write: file not open");
+    return -1;
+  }
+
+  // current pos
+  int pos = myfd->pos;
+  // pos become this at the end of read
+  int endpos = pos + count;
+
+  // add enough frames
+  int needed_frame_count = endpos / CART_FRAME_SIZE + 1;
+  int frame_need_to_add = needed_frame_count - myfd->frame_count;
+  if (frame_need_to_add > 0) {
+    logMessage(CartDebugLevel, "cart_write: add_frame: fd: %d count: %d",
+               fd, frame_need_to_add);
+    if (add_frame(myfd, frame_need_to_add) < 0)
+      return -1;
+  }
+
+  // calculate frame info
+
+  // which frame of the file we are using
+  int frame_idx = pos / CART_FRAME_SIZE;
+  // position of each frame
+  int frame_pos = pos % CART_FRAME_SIZE;
+  int unwritten_count = count;
+
+  // write data
+
+  // amount of bytes we are writing into frame each time
+  int frame_count;
+  struct frame *frame;
+  // position of buffer buf
+  int bufpos = 0;
+  while (pos < endpos) {
+    frame = myfd->frames + frame_idx;
+    frame_count = min(CART_FRAME_SIZE - frame_pos, unwritten_count);
+
+    logMessage(CartDebugLevel, "cart_write: loop: pos: %d frame_idx: %d frame_pos: %d frame_count: %d bufpos: %d",
+               pos, frame_idx, frame_pos, frame_count, bufpos);
+
+    if (write_frame(frame, buf, frame_pos, frame_count, bufpos) < 0) {
+      logMessage(CartDebugLevel, "cart_write: write_frame failed");
+      return -1;
+    }
+
+    frame_idx++;
+    frame_pos = 0;
+    bufpos += frame_count;
+    pos += frame_count;
+    unwritten_count -= frame_count;
+  }
+
+  // update fd
+  myfd->pos = pos;
+  myfd->size = max(myfd->size, pos);
+
+  logMessage(CartDebugLevel, "cart_write: finished: pos: %d size: %d", myfd->pos, myfd->size);
+
+  // Return successfully
+  return (count);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_seek
+// Description  : Seek to specific point in the file
+//
+// Inputs       : fd - filename of the file to write to
+//                loc - offfset of file in relation to beginning of file
+// Outputs      : 0 if successful, -1 if failure
+
+// 1. get the file by FD
+// 2. change pos to LOC
+int32_t cart_seek(int16_t fd, uint32_t loc) {
+
+  if (fd >= 1024 || fd < 0) {
+    logMessage(CartDebugLevel, "cart_seek: invalid fd: %d", fd);
+    return -1;
+  }
+
+  struct fd *myfd = fd_table + fd;
+
+  if (myfd->state != FD_OPEN) {
+    logMessage(CartDebugLevel, "cart_seek: file not open");
+    return -1;
+  }
+
+  if (loc > myfd->size) {
+    logMessage(CartDebugLevel, "cart_seek: loc > file size");
+    return -1;
+  }
+
+  myfd->pos = loc;
+
+  // Return successfully
+  return (0);
+}

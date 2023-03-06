@@ -1,0 +1,252 @@
+#include <stdio.h>
+#include <string.h>
+#include "csapp.h"
+#include "cache.h"
+
+/* You won't lose style points for including this long line in your code */
+static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
+
+void doit(int clientfd,CacheList *cache);
+void *thread(void *var);
+int parse_url(const char *url,char *host, char *port, char *path);
+void clienterror(int fd,char *cause,char *errnum, char *shortmsg, char *longmsg);
+
+int main(int argc,char **argv )
+{
+  int listenfd,connfd;
+  char hostname[MAXLINE],port[MAXLINE];
+  socklen_t clientlen;
+  struct sockaddr_storage clientaddr;
+  CacheList cache_store;
+  cache_init(&cache_store);
+  
+  /* Check command line args */
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s <port>\n", argv[0]);
+    exit(1);
+  }
+
+  Signal(SIGPIPE, SIG_IGN);
+  listenfd = Open_listenfd(argv[1]);
+  while (1) {
+    clientlen = sizeof(clientaddr);
+    connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen); 
+    Getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
+    printf("Accepted connection from (%s, %s)\n", hostname, port);
+    doit(connfd,&cache_store);                                             
+    Close(connfd);                                           
+  }    
+  printf("%s", user_agent_hdr);
+  return 0;
+}
+
+void doit(int clientfd,CacheList *cache)
+{
+  int endserverfd;
+  
+  //store info from client
+  char tem_buf[MAXLINE];
+  
+  // store info from server
+  char serverbuf[MAXLINE];
+
+  // char buf[MAXLINE];
+  char method[MAXLINE],uri[MAXLINE],version[MAXLINE];
+
+  //store the line arguments
+  char hostname[MAXLINE],path[MAXLINE],port[MAXLINE];
+  rio_t fromclient,toEndserver;
+  struct CachedItem* newNode=(struct CachedItem *)Malloc(sizeof(struct CachedItem ));
+  
+  //store the headers
+  char newreq[MAXLINE];
+  memset(newreq,0,MAXLINE);
+
+  //store the items
+  char *items;
+  items = (char*)malloc(MAXLINE);
+
+  //read the request line and headers
+  rio_readinitb(&fromclient,clientfd);
+  
+
+  //error handles
+  if (!rio_readlineb(&fromclient,tem_buf,MAXLINE))
+  {
+    return;
+  }
+  sscanf(tem_buf, "%s %s %s",method,uri,version);
+  if (strcasecmp(method,"GET"))
+  {
+    clienterror(clientfd,method,"501","Not Implemented", "Proxy Server does not implement this method");
+    return;
+  }
+  
+  
+  if (!parse_url(uri,hostname,port,path))
+  {
+    clienterror(clientfd,uri,"404","Not found", "Request could not be parsed");
+    return;
+  } 
+  if((newNode=find(uri,cache))!=NULL)
+    {
+      rio_writen(clientfd,newNode->headers,strlen(newNode->headers));
+      rio_writen(clientfd,newNode->item_p,newNode->size);
+      return;
+    }
+  else{
+    //did not find the cache in the list
+    endserverfd = open_clientfd(hostname,port);
+    rio_readinitb(&toEndserver,endserverfd);
+    //build the first line
+    sprintf(tem_buf,"GET %s HTTP/1.0\r\n",path);
+    rio_writen(endserverfd,tem_buf,strlen(tem_buf));
+
+    //init the request line
+    char host_store[MAXLINE];
+    sprintf(host_store,"Host: %s\r\n",hostname);
+    rio_writen(endserverfd,host_store,strlen(host_store));
+    
+    strcpy(tem_buf,"Connection: close\r\n");
+    rio_writen(endserverfd,tem_buf,strlen(tem_buf));
+
+    strcpy(tem_buf,"Proxy-Connection: close\r\n");
+    rio_writen(endserverfd,tem_buf,strlen(tem_buf));
+
+    strcpy(tem_buf,user_agent_hdr);
+    rio_writen(endserverfd,tem_buf,strlen(tem_buf));
+
+
+    // read the line from the client once at a time
+    while (rio_readlineb(&fromclient,tem_buf,MAXLINE)>2 )
+      {
+	if(!strcmp(tem_buf,"\r\n")) break;
+	if(strstr(tem_buf,"Host:")!=NULL) continue;
+	if(strstr(tem_buf,"Connection:")!=NULL) continue;
+	if(strstr(tem_buf,"Proxy-Connection:")!=NULL) continue;
+	if(strstr(tem_buf,"User-Agent:")!=NULL) continue;
+	rio_writen(endserverfd,tem_buf,strlen(tem_buf));
+      }
+
+    rio_writen(endserverfd,tem_buf,strlen(tem_buf));
+    rio_readinitb(&toEndserver,endserverfd);
+    
+    //read from server
+    while((rio_readlineb(&toEndserver,serverbuf ,MAXLINE)>2)){
+      rio_writen(clientfd,serverbuf,strlen(serverbuf));
+      strncat(newreq,serverbuf,strlen(serverbuf));
+    }  
+    rio_writen(clientfd,serverbuf,strlen(serverbuf));
+    strncat(newreq,serverbuf,strlen(serverbuf));
+    
+    int n;
+    while ((n = rio_readnb(&toEndserver,serverbuf,MAXLINE))>0){
+      memcpy(items,serverbuf,n);
+      rio_writen(clientfd,serverbuf,n);
+    }
+
+    //store the new cache into the list 
+    cache_URL(uri,newreq,items,strlen(items),cache);
+    close(endserverfd);
+    return;
+  }
+}
+
+
+
+void clienterror(int fd,char *cause,char *errnum, char *shortmsg, char *longmsg)
+{
+  char buf[MAXLINE],body[MAXBUF];
+
+  //build the http response body
+  sprintf(body,"<html><title>Proxy Error</title>");
+  sprintf(body,"%s<body bgcolor=""ffffff"">\r\n",body);
+  sprintf(body,"%s%s: %s\r\n",body,errnum,shortmsg);
+  sprintf(body,"%s<p>%s: %s\r\n",body,longmsg,cause);
+  sprintf(body,"%s<hr><em>The Proxy Web server</em>\r\n",body);
+
+  // print the HTTP response
+  sprintf(buf,"HTTP/1.0 %s %s\r\n",errnum,shortmsg);
+  rio_writen(fd,buf,strlen(buf));
+  sprintf(buf, "Content-type: text/html\r\n");
+  rio_writen(fd,buf,strlen(buf));
+  sprintf(buf, "Content-length: %d\r\n\r\n",(int)strlen(body));
+  rio_writen(fd,buf,strlen(buf));
+  rio_writen(fd,body,strlen(body));  
+}
+
+int parse_url(const char *url,char *host, char *port, char *path)
+{
+  char tem_host[10000];
+  if (strncasecmp(url,"http://",6)!=0)
+      {
+         return 0;
+      }
+  strcpy(tem_host,url+7);
+  int url_len =strlen(tem_host);
+  int count;
+  int i;
+  for (count=0;count<url_len;++count)
+  {
+    if (tem_host[count]==':')
+    {
+      strncpy(host,tem_host,count);
+      host[count]='\0';
+      count++;
+      i=count;
+      while (count<url_len)
+      {
+        if (tem_host[count] == '/')
+        {
+          int end=count-i;
+          strncpy(port,tem_host+i,end);
+          port[end]='\0';
+          if (tem_host[count+1]!=0)
+          {
+            int end=url_len-count;
+            strncpy(path,tem_host+count,end);
+            path[end]='\0';
+            return 1;
+          }
+          else
+          {
+            strcpy(path,"/\0");
+            return 1;
+          }
+        }
+        count++;
+      }
+      if (count==url_len)
+      {
+        strcpy(port,tem_host+i);
+        strcpy(path,"/\0");
+        return 1;
+      }
+    }
+    if (tem_host[count] == '/')
+    {
+      strncpy(host,tem_host,count);
+      host[count]='\0';
+      strcpy(port,"80\0");
+      strncpy(path,tem_host+count,url_len-count);
+      path[url_len-count]='\0';
+      return 1;
+    }
+  }
+  if (count==url_len)
+  {
+    if (tem_host[count]=='/')
+    {
+      strncpy(host,tem_host,count-1);
+      host[count-1]='\0';
+    }else
+    {
+      strcpy(host,tem_host);
+    }
+    strcpy(port,"80\0");
+    strcpy(path,"/\0");
+    return 1;
+  }
+  return 1;
+}
+

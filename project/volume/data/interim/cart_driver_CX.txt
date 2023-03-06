@@ -1,0 +1,417 @@
+////////////////////////////////////////////////////////////////////////////////
+//
+//  File           : cart_driver.c
+//  Description    : This is the implementation of the standardized IO functions
+//                   for used to access the CART storage system.
+//
+//  Author         : [**Xing Chen**]
+//  PSU email      : [**xzc5179@psu.edu**]
+//
+
+// Includes
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+// Project Includes
+#include "cart_driver.h"
+#include "cart_controller.h"
+
+//
+// Implementation
+
+//constants definition
+#define MAX_FILE_NUMBER 1024
+
+//Functional Prototypes
+int16_t find_file_byname(char* path);
+int16_t create_empty_file(char* path);
+
+// Type definitions
+// name - path of the file, assumed to be unique
+// total_size - total number of bytes the file contains
+// pos - the current position of the file either to read or write
+// is_open - 1 being open, 0 being closed
+// frames - maps the index of frame in file to the index of frame in cart
+// cart - maps the index of frame in file to the index of cart in cart
+typedef struct
+{
+  char name[128];
+  int32_t total_size;
+  int32_t pos;
+  int is_open;
+  int16_t frames[100];
+  int16_t carts[100];
+}File;
+
+//an fd table storing all files
+//using fd number as index
+//a File struct is stored in the corresponding fd to represent the file
+//null pointer otherwise
+File** files;
+
+//the number of frames that has been used in the cart
+int frame_count;
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_poweron
+// Description  : Startup up the CART interface, initialize filesystem
+//
+// Inputs       : none
+// Outputs      : 0 if successful, -1 if failure
+
+int32_t cart_poweron(void) {
+
+  //intialize cart
+  cart_io_bus((CartXferRegister)CART_OP_INITMS << 56, NULL);
+  int16_t CT1;
+  for (CT1 = 0; CT1 < CART_MAX_CARTRIDGES; ++CT1)
+  {
+    cart_io_bus(((CartXferRegister)CART_OP_LDCART << 56) | ((CartXferRegister)CT1 << 31), NULL);
+    cart_io_bus((CartXferRegister)CART_OP_BZERO << 56, NULL);
+  }
+
+  //initialize driver
+  files = calloc(MAX_FILE_NUMBER, sizeof(File*));
+  frame_count = 0;
+
+  // Return successfully
+  return(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_poweroff
+// Description  : Shut down the CART interface, close all files
+//
+// Inputs       : none
+// Outputs      : 0 if successful, -1 if failure
+
+int32_t cart_poweroff(void) {
+
+  //power off the cart
+  cart_io_bus((CartXferRegister)CART_OP_POWOFF << 56, NULL);
+
+  //close and free all files
+  int16_t fd;
+  for (fd = 0; fd < MAX_FILE_NUMBER; ++fd)
+  {
+    if(files[fd] != NULL)
+    {
+      if(cart_close(fd) == -1)
+        return -1;
+
+      free(files[fd]);
+    }
+  }
+
+  //free the fd table
+  free(files);
+
+  // Return successfully
+  return(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_open
+// Description  : This function opens the file and returns a file handle
+//
+// Inputs       : path - filename of the file to open
+// Outputs      : file handle if successful, -1 if failure
+
+int16_t cart_open(char *path) {
+
+  //try to find an already open file with the same name
+  int16_t fd = find_file_byname(path);
+
+  //assign an empty fd number if not already existed
+  if(fd == -1)
+    fd = create_empty_file(path);
+
+  //error occur, fd table is full
+  if(fd == -1)
+    return -1;
+
+  files[fd]->is_open = 1;
+
+  // THIS SHOULD RETURN A FILE HANDLE
+  return fd;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_close
+// Description  : This function closes the file
+//
+// Inputs       : fd - the file descriptor
+// Outputs      : 0 if successful, -1 if failure
+
+int16_t cart_close(int16_t fd) {
+
+  //bad fd
+  if(fd < 0 || fd > MAX_FILE_NUMBER || files[fd] == NULL)
+    return -1;
+
+  files[fd]->is_open = 0;
+
+  // Return successfully
+  return (0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_read
+// Description  : Reads "count" bytes from the file handle "fh" into the 
+//                buffer "buf"
+//
+// Inputs       : fd - filename of the file to read from
+//                buf - pointer to buffer to read into
+//                count - number of bytes to read
+// Outputs      : bytes read if successful, -1 if failure
+
+int32_t cart_read(int16_t fd, void *buf, int32_t count) {
+
+  //find the file
+  if(fd < 0 || fd >= MAX_FILE_NUMBER)
+    return -1;
+  if(files[fd] == NULL)
+    return -1;
+  File* file = files[fd];
+
+  //when file is not previously opened
+  if(file->is_open != 1)
+    return -1;
+
+  //the number of bytes already read
+  int count_read = 0;
+
+  //keep reading until the end
+  //read no more than CART_FRAME_SIZE in each iteration
+  while(count_read != count && file->pos < file->total_size)
+  {
+
+    char* text = calloc(CART_FRAME_SIZE, sizeof(char));
+
+    //find the current reading frame of the file
+    int index = file->pos / CART_FRAME_SIZE;
+
+    //load the existing data of the frame from cart
+    cart_io_bus(((CartXferRegister)CART_OP_LDCART << 56) | ((CartXferRegister)file->carts[index] << 31), NULL);
+    cart_io_bus(((CartXferRegister)CART_OP_RDFRME << 56) | ((CartXferRegister)file->frames[index] << 15), text);
+
+    //decide the number of bytes to read
+    //calculate the minimum among: the remaining bytes in current frame,
+    //                             the remaining bytes of the file,
+    //                             and the remaining bytes to read
+    int pos_in_frame = file->pos % CART_FRAME_SIZE;
+    int num_read = CART_FRAME_SIZE;
+    if(pos_in_frame < CART_FRAME_SIZE)
+      num_read = CART_FRAME_SIZE - pos_in_frame;
+    if(file->total_size - file->pos < num_read)
+      num_read = file->total_size - file->pos;
+    if(count - count_read < num_read)
+      num_read = count - count_read;
+
+    //read the data
+    memcpy(buf + count_read, text + pos_in_frame, num_read);
+    count_read += num_read;
+
+    //update the position of the file
+    file->pos += num_read;
+
+    free(text);
+  }
+
+  // Return successfully
+  return count_read;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_write
+// Description  : Writes "count" bytes to the file handle "fh" from the 
+//                buffer  "buf"
+//
+// Inputs       : fd - filename of the file to write to
+//                buf - pointer to buffer to write from
+//                count - number of bytes to write
+// Outputs      : bytes written if successful, -1 if failure
+
+int32_t cart_write(int16_t fd, void *buf, int32_t count) {
+
+  //find the file
+  if(fd < 0 || fd >= MAX_FILE_NUMBER)
+    return -1;
+  if(files[fd] == NULL)
+    return -1;
+
+  File* file = files[fd];
+
+  //when file is not previously opened
+  if(file->is_open != 1)
+    return -1;
+
+  //the number of bytes reamined to be written
+  int count_remain = count;
+
+  //in case the position is at half way of an old frame
+  if(file->pos % CART_FRAME_SIZE != 0)
+  {
+    char* text = calloc(CART_FRAME_SIZE, sizeof(char));
+    int frame_index = file->pos / CART_FRAME_SIZE;
+
+    //read the existing data
+    cart_io_bus(((CartXferRegister)CART_OP_LDCART << 56) | ((CartXferRegister)file->carts[frame_index] << 31), NULL);
+    cart_io_bus(((CartXferRegister)CART_OP_RDFRME << 56) | ((CartXferRegister)file->frames[frame_index] << 15), text);
+
+    //decide the number of bytes written
+    int pos_in_frame = file->pos % CART_FRAME_SIZE;
+    int num_write = count_remain;
+    if(CART_FRAME_SIZE - pos_in_frame < count_remain)
+      num_write = CART_FRAME_SIZE - pos_in_frame;
+
+    //update the position and size of file
+    file->pos += num_write;
+    if(file->pos > file->total_size)
+      file->total_size = file->pos;
+
+    //write the data
+    memcpy(text + pos_in_frame, buf, num_write);
+    count_remain -= num_write;
+    cart_io_bus(((CartXferRegister)CART_OP_WRFRME << 56) | ((CartXferRegister)file->frames[frame_index] << 15), text);
+
+    free(text);
+  }
+
+  //assert pos % CART_FRAME_SIZE == 0 at this step
+  //write no more than one frame in each iteration
+  while(count_remain != 0)
+  {
+
+    char* text = calloc(CART_FRAME_SIZE, sizeof(char));
+
+    //indicate the current frame of the file
+    int frame_index;
+
+    //ask for a new frame
+    if(file->pos == file->total_size)
+    {
+
+      frame_index = file->pos / CART_FRAME_SIZE;
+      file->carts[frame_index] = frame_count / CART_CARTRIDGE_SIZE;
+      file->frames[frame_index] = frame_count % CART_CARTRIDGE_SIZE;
+      frame_count++;
+    }
+
+    //or use an old frame
+    else
+    {
+      frame_index = file->pos / CART_FRAME_SIZE;
+    }
+
+    //read the old data from cart of the frame
+    cart_io_bus(((CartXferRegister)CART_OP_LDCART << 56) | ((CartXferRegister)file->carts[frame_index] << 31), NULL);
+    cart_io_bus(((CartXferRegister)CART_OP_RDFRME << 56) | ((CartXferRegister)file->frames[frame_index] << 15), text);
+
+    //decide the number of bytes to write in this iteration
+    int num = CART_FRAME_SIZE;
+    if(count_remain < CART_FRAME_SIZE)
+      num = count_remain;
+
+    //update the position and total size of the file
+    file->pos += num;
+    if(file->pos > file->total_size)
+      file->total_size = file->pos;
+
+    //write the bytes
+    memcpy(text, buf + (count - count_remain), num);
+    count_remain -= num;
+    cart_io_bus(((CartXferRegister)CART_OP_WRFRME << 56) | ((CartXferRegister)file->frames[frame_index] << 15), text);
+
+    free(text);
+
+  }
+
+  // Return successfully
+  return (count);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : cart_seek
+// Description  : Seek to specific point in the file
+//
+// Inputs       : fd - filename of the file to write to
+//                loc - offfset of file in relation to beginning of file
+// Outputs      : 0 if successful, -1 if failure
+
+int32_t cart_seek(int16_t fd, uint32_t loc) {
+
+  //find the file
+  if(fd < 0 || fd >= MAX_FILE_NUMBER)
+    return -1;
+  if(files[fd] == NULL)
+  {
+    return -1;
+  }
+
+  File* file = files[fd];
+
+  if(loc > file->total_size)
+    return -1;
+
+  //locate the position of the file
+  file->pos = loc;
+
+  // Return successfully
+  return (0);
+}
+
+// find an opened file with a specific name
+int16_t find_file_byname(char* path)
+{
+
+  //iterate through all files and compare the name
+  int16_t fd;
+  for (fd = 0; fd < MAX_FILE_NUMBER; ++fd)
+  {
+
+    if(files[fd] == NULL)
+      continue;
+
+    if(strcmp(files[fd]->name, path) == 0)
+      return fd;
+  }
+
+  //not found
+  return -1;
+}
+
+// find the first empty fd in fd table and create an empty file
+int16_t create_empty_file(char* path)
+{
+
+  int16_t fd;
+  for(fd = 0; fd < MAX_FILE_NUMBER; ++fd)
+  {
+
+    if(files[fd] == NULL)
+    {
+
+      //create an empty file at the location
+      File* file = calloc(1, sizeof(File));
+      files[fd] = file;
+
+      //initialize the file
+      strcpy(file->name, path);
+      file->total_size = 0;
+      file->pos = 0;
+      return fd;
+    }
+  }
+
+  //table is full
+  return -1;
+}

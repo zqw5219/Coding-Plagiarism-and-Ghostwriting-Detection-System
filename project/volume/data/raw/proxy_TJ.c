@@ -1,0 +1,317 @@
+//Email:finiantang0826@gmail.com
+//Name: Jing Tang
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "csapp.h"
+#include "cache.h"
+
+void doit(int fd, CacheList *cachelist);
+int parse_url(const char *url, char *host, char *port, char *path);
+void request_header(char*host,char*path, char* output_header, rio_t rio);
+/* You won't lose style points for including this long line in your code */
+static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
+static const char *conn_header = "Connection: close\r\n";
+static const char *prox_header = "Proxy-Connection: close\r\n";
+static const char *end = "\r\n";
+
+int main(int argc, char** argv)
+{
+  int listenfd;
+  int connfd;
+  char hostname[MAXLINE];
+  char* port = NULL;
+  socklen_t clientlen;
+  struct sockaddr_storage clientaddr;
+  CacheList cachelist;
+
+  //check whether the input is a valid input
+  if(argc != 2){
+    printf("Not a valid website\n");
+    exit(1);
+  }
+
+  //init cache
+  cache_init(&cachelist);
+
+  //connect to server
+  listenfd= open_listenfd(argv[1]);
+
+  //accept connect and get information through port
+  while (1) {
+    clientlen= sizeof(clientaddr);
+    connfd= accept(listenfd, (SA *)&clientaddr, &clientlen);
+    if(connfd<0){
+      printf("Accept Error\n");
+    }
+    getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE,port, MAXLINE, 0);
+    printf("Accepted connection from (%s, %s)\n", hostname, port);
+    doit(connfd,&cachelist);
+    close(connfd);
+  }
+  //destruct cache
+  cache_destruct(&cachelist);
+  return 0;
+}
+
+void doit(int fd, CacheList *cachelist){
+  char buf[MAXLINE], method[MAXLINE], url[MAXLINE], version[MAXLINE];
+  char host[MAXLINE];
+  char port[MAXLINE];
+  char path[MAXLINE];
+  int serfd;
+  char client[MAXLINE];
+  int result = 0;
+  size_t n = 1;
+  char *item = malloc(MAX_OBJECT_SIZE);
+  size_t size = 0;
+  int status;
+  char content[14] = "Content-Length";
+  size_t csize = 0;
+  char header[MAXLINE];
+  memset(header,0,MAXLINE); 
+ 
+  CachedItem *cache;
+  rio_t rio,serrio;
+  rio_readinitb(&rio, fd);
+
+  //check whether the client input something
+  if (!rio_readlineb(&rio, buf, MAXLINE)){
+    printf("There's nothing in the buf");
+    return;
+  }
+  
+  //scan the information from client
+  sscanf(buf, "%s %s %s", method, url, version);
+
+  //get port,host and path from url
+  result = parse_url(url,host,port,path);
+  if(result == 0){
+    printf("Not a valid website");
+    return;
+  }
+
+  //check whether this url has already existed in cachelist
+  //if it do exist, return the infomation to client
+  //if not, continue going
+  cache = find(url,cachelist);
+  if(cache != NULL){
+    rio_writen(fd,cache->headers,strlen(cache->headers));
+    rio_writen(fd,cache->item_p,cache->size);
+    printf("FIND IT !!!!!!!! \n\n");
+    return;
+  }
+
+  printf("Not FIND IT !!!!!\n\n"); 
+
+  //get the header from client and modify to the form we want
+  request_header(host,path, client, rio);
+ 
+  //connect to the end server
+  serfd = open_clientfd(host, port);
+  if(serfd<0){
+    printf("Connection failed\n");
+    return;
+  }
+
+  //begin to read the feedback from server and write those to the client
+  rio_readinitb(&serrio,serfd);
+ 
+  rio_writen(serfd, client, strlen(client));  
+
+  //read the header part
+  //check whther there is a 200 OK
+  //get the content length
+  while((n=rio_readlineb(&serrio,buf,MAXLINE))>2){
+    rio_writen(fd, buf, n);
+    strcat(header,buf);
+    if(strncasecmp(buf,version,n)){
+      sscanf(buf+8,"%d",&status);
+    }
+    if(strncasecmp(buf,content,14)==0){
+      sscanf(buf,"%s %zu",content,&csize);
+    }
+  }
+
+  rio_writen(fd,buf,strlen(buf));
+  strcat(header,buf);
+ 
+  //read the item part      
+  while((n=rio_readnb(&serrio, buf, MAXLINE))>0){
+    printf("Proxy received.");
+    rio_writen(fd,buf,n);
+    size+=n;
+    if(size<MAX_OBJECT_SIZE){
+      memcpy(item,buf,n);
+    }
+  }
+
+  printf("Header: %s \n\n", header);
+  printf("Item: %s \n\n", item);
+  printf("URI: %s \n\n", url); 
+ 
+  //check conditions and cache URL
+  if (csize <= MAX_OBJECT_SIZE && status == 200 && csize == size) { 
+    cache_URL(url,header,(void*)item,size, cachelist);
+  }
+  else{
+    free(item);
+    printf("Cannot Cache URL");
+  }
+ 
+  //check whether it is a get method 
+  if(strcasecmp(method, "GET")){
+    printf("Only support get method");
+    return;
+  }
+
+  printf("DONE !!!!!!\n\n\n");
+  close(serfd);
+  return;
+}
+
+void request_header(char*host,char*path, char* output_header, rio_t rio){
+  char getheader[MAXLINE];
+  char hostheader[MAXLINE];
+  char other[MAXLINE];
+  char buf[MAXLINE];
+  char host_st[4] = "Host";
+  char connection[10] = "Connection";
+  char useragent[10] = "User-Agent";
+  char proxyconn[16] = "Proxy-Connection";
+  char ifmod[17] = "If-Modified-Since";
+  char ifnone[13] = "If-None-Match";
+  sprintf(getheader,"GET %s HTTP/1.0\r\n",path);
+
+  
+  while(rio_readlineb(&rio,buf,MAXLINE)> 2){
+   
+    //find the host host part
+    //if there's no host in the header, create a new one
+    if(strncasecmp(buf,host_st,strlen(host_st))>2){
+      strcpy(hostheader,buf);
+    }
+    //check whether they are these five types of headers
+    //if it is not,keep it
+    if(strncasecmp(buf,connection,10)&&strncasecmp(buf,useragent,10)&&strncasecmp(buf,proxyconn,16)&&strncasecmp(buf,ifmod,17)&&strncasecmp(buf,ifnone,13)){
+       strcat(other,buf);
+     }
+  }
+
+  //creat a new host if there's nothing in the header
+  if(strlen(hostheader) == 0){
+    sprintf(hostheader,"Host: %s\r\n",host);
+  }
+
+  //form requewt header
+  sprintf(output_header,"%s%s%s%s%s%s%s",getheader,user_agent_hdr,hostheader,conn_header,prox_header,other,end);
+  printf(output_header);
+}
+
+
+int parse_url(const char *url, char *host, char *port, char *path) {
+  int pos;
+  int len = strlen(url);
+  int myhost = -1;
+  int myport = -1;
+  int mypath = -1;
+  int i;
+  char slash[1] = "/";
+  char colon[1] = ":";
+  char eighty[2] = "80";
+  char http[7] = "http://";
+  if(url == NULL){
+    return 0;
+  }
+
+  //check whether it starts with http
+  if(strncasecmp(url,http,7)!=0){
+    pos = 0;
+    return 0;
+  }
+  else{
+    pos = 7;
+  }
+
+  //find the first colon or the first slash
+  for(i = pos;i<=len;i++){
+
+    if(strncasecmp(url+i,colon,1)==0){
+      myhost = i;
+      myport = 0;
+      break;
+   } 
+
+    if(strncasecmp(url+i,slash,1)==0){
+      myhost = i;
+      break;
+    }
+  }
+
+  //if there's no port, return 1
+  if(myhost == 7){
+    return 1;
+  }
+
+  //if there's no colon or slash, host is all part of url
+  if(myhost == -1){
+    myhost = len;
+  }
+
+  //if port exist, find the slash after colon
+  if(myport == 0 && myhost<len){
+    for(i = myhost;i<len;i++){
+      if(strncasecmp(url+i,slash,1)==0){
+        myport = i;
+      }
+    }
+  }
+
+  //if there's no slash, port is the rest part of url after host
+  if(myport ==0){
+    myport = len;
+  }
+
+  //if there's no port
+  if(myport == -1 && myhost < len){
+    mypath = 0;
+  }
+
+  //if there is a port
+  if(myport != -1 && myport < len){
+    mypath = 1;
+  }
+
+  //copy the host part
+  strncpy(host,url+pos,myhost-pos);
+  host[myhost-pos] =0;
+
+  //copy the port part
+  if(myport != -1){
+    strncpy(port,url+myhost+1,myport-(myhost+1));
+    port[myport-(myhost+1)] = 0;
+  }
+  else{
+    strncpy(port,eighty,2);
+    port[2] = 0;
+  }
+
+  //copy the path part
+  if(mypath == 0){
+    strncpy(path,url+myhost,len-myhost);
+    path[len-myhost] = 0;
+  }
+  else{
+    if(mypath == 1){
+      strncpy(path,url+myport,len-myport);
+      path[len-myport] = 0;
+    }
+
+    else{
+      strncpy(path,slash,1);
+      path[1] = 0;
+    }
+  }
+  return 1;
+}

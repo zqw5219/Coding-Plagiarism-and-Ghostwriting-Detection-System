@@ -1,0 +1,80 @@
+#####################################################################
+----------------Process Starts----------------
+----Step: Train Model for projectType_bits Starts----
+----Step: Train Model Ends----
+----Step: Make Prediction Starts----
+Mean Absolute Error: 0.2 degrees.
+----Step: Make Prediction Ends----
+----Step: Determine Performance Starts----
+Accuracy: 84.25 %.
+----Step: Determine Performance Ends----
+#####################################################################
+----------------Process Starts----------------
+----Step: Train Model for projectType_cart Starts----
+----Step: Train Model Ends----
+----Step: Make Prediction Starts----
+Mean Absolute Error: 0.22 degrees.
+----Step: Make Prediction Ends----
+----Step: Determine Performance Starts----
+Accuracy: 85.88 %.
+----Step: Determine Performance Ends----
+#####################################################################
+----------------Process Starts----------------
+----Step: Train Model for projectType_proxy Starts----
+----Step: Train Model Ends----
+----Step: Make Prediction Starts----
+Mean Absolute Error: 0.02 degrees.
+----Step: Make Prediction Ends----
+----Step: Determine Performance Starts----
+Accuracy: 97.75 %.
+----Step: Determine Performance Ends----
+#####################################################################
+----------------Process Starts----------------
+----Step: Train Model for projectType_tsh Starts----
+----Step: Train Model Ends----
+----Step: Make Prediction Starts----
+Mean Absolute Error: 0.02 degrees.
+----Step: Make Prediction Ends----
+----Step: Determine Performance Starts----
+Accuracy: 98.25 %.
+----Step: Determine Performance Ends----
+#####################################################################
+----------------Process Starts----------------
+----Step: Train Model for authorName_CX Starts----
+----Step: Train Model Ends----
+----Step: Make Prediction Starts----
+Mean Absolute Error: 0.45 degrees.
+----Step: Make Prediction Ends----
+----Step: Determine Performance Starts----
+Accuracy: 55.0 %.
+----Step: Determine Performance Ends----
+#####################################################################
+----------------Process Starts----------------
+----Step: Train Model for authorName_FYA Starts----
+----Step: Train Model Ends----
+----Step: Make Prediction Starts----
+Mean Absolute Error: 0.38 degrees.
+----Step: Make Prediction Ends----
+----Step: Determine Performance Starts----
+Accuracy: 79.25 %.
+----Step: Determine Performance Ends----
+#####################################################################
+----------------Process Starts----------------
+----Step: Train Model for authorName_TEMP Starts----
+----Step: Train Model Ends----
+----Step: Make Prediction Starts----
+Mean Absolute Error: 0.46 degrees.
+----Step: Make Prediction Ends----
+----Step: Determine Performance Starts----
+Accuracy: 75.25 %.
+----Step: Determine Performance Ends----
+#####################################################################
+----------------Process Starts----------------
+----Step: Train Model for authorName_TJ Starts----
+----Step: Train Model Ends----
+----Step: Make Prediction Starts----
+Mean Absolute Error: 0.46 degrees.
+----Step: Make Prediction Ends----
+----Step: Determine Performance Starts----
+Accuracy: 53.5 %.
+----Step: Determine Performance Ends----
