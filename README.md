@@ -1,6 +1,4 @@
-# Coding Plagiarism and Ghostwriting Detection System
-
-## Convention
+## Coding Plagiarism and Ghostwriting Detection System
 
 Following this directory structure
 ```
